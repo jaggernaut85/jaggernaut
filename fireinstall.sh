@@ -1,0 +1,73 @@
+#!/bin/bash
+
+echo 'What is the name of your website (please include .com)'
+
+read website
+
+dbpass=$(openssl rand -base64 16)
+mysqlroot=$(openssl rand -base64 16)
+webroot=/var/www/vhosts/$website/httpdocs/
+
+add-apt-respository ppa:ondrej/php
+apt-get update
+apt-get upgrade
+apt-get install -y apache2 'php7.3' php7.3-cli php7.3-common php7.3-json php7.3-opcache php7.3-mysql php7.3-mbstring libmcrypt-dev php7.3-zip php7.3-fpm php7.3-bcmath php7.3-intl php7.3-xml php7.3-curl php7.3-gd 'libapache2-mod-php7.3' php7.3-ldap 
+
+debconf-set-selections <<< "mysql-server mysql-server/root_password password $mysqlroot"
+sudo debconf-set-selections <<< "mysql-server mysql-server/root_password_again password $mysqlroot"
+apt-get -y install 'mysql-server'
+curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
+
+
+mkdir -p /var/www/vhosts/$website/{httpdocs,logs}
+sudo chown -R www-data:www-data $webroot
+sudo chmod -R 775 $webroot/storage
+sudo -u www-data composer create-project grumpydictator/firefly-iii --no-dev  -d $webroot --prefer-dist firefly-iii 5.2.2
+
+cat >/tmp/user.sql <<EOL
+CREATE USER 'firefly'@'localhost' IDENTIFIED BY '${dbpass}';
+CREATE DATABASE firefly;
+GRANT ALL PRIVILEGES ON firefly.* TO 'firefly'@'localhost';
+FLUSH PRIVILEGES;
+EOL
+
+mysql -u root --password="$mysqlroot"< /tmp/user.sql >/dev/null 2>&1
+sed -i "s:"DB_USERNAME=homestead":"DB_USERNAME=firefly":" $webroot/firefly-iii/.env
+sed -i "s:"DB_DATABASE=homestead":"DB_DATABASE=firefly":" $webroot/firefly-iii/.env
+sed -i "s:"DB_PASSWORD=secret":"DB_PASSWORD=$dbpass":" $webroot/firefly-iii/.env
+sed -i "s:"APP_URL=http://localhost":"APP_URL=http://$website":" $webroot/firefly-iii/.env
+
+sudo chown -R www-data:www-data $webroot
+sudo chmod -R 775 $webroot
+
+php $webroot/firefly-iii/artisan migrate:install
+php $webroot/firefly-iii/artisan migrate:refresh --seed
+php $webroot/firefly-iii/artisan firefly:upgrade-database
+php $webroot/firefly-iii/artisan firefly:verify
+php $webroot/firefly-iii/artisan passport:install
+
+cat >/etc/apache2/sites-available/$website.conf <<EOL
+<VirtualHost *:80>
+ServerName ${website}
+ServerAlias ${website}
+ServerAdmin root@localhost.com
+DocumentRoot /var/www/vhosts/${website}/httpdocs/firefly-iii/public
+<Directory ${webroot}/firefly-iii/public/>
+    Options Indexes FollowSymLinks
+    AllowOverride All
+    Require all granted
+</Directory>
+ErrorLog /var/www/vhosts/${website}/logs/error.log
+CustomLog /var/www/vhosts/${website}/logs/access.log combined
+</VirtualHost>
+EOL
+a2dissite 000-default.conf
+a2ensite $website.conf
+a2enmod rewrite
+service apache2 restart
+
+cat <<EOF
+###### Store these in a safe place they will dissapear after this ######
+Mysql root password is  ${mysqlroot}
+Firefly db user password is  ${dbpass}
+EOF
